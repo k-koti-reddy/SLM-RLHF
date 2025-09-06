@@ -1,64 +1,70 @@
-name: Clean Notebooks (auto-commit for collaborators)
+- name: Remove widget state & outputs from notebooks (surgical fix)
+  shell: bash
+  run: |
+    set -euo pipefail
 
-on:
-  push:
-    branches: [ "**" ]
-    paths: [ "**/*.ipynb" ]
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [ "**/*.ipynb" ]
+    # collect tracked notebooks in this commit
+    mapfile -t NBS < <(git ls-files '*.ipynb' || true)
+    if [ "${#NBS[@]}" -eq 0 ]; then
+      echo "No notebooks found."
+      exit 0
+    fi
 
-permissions:
-  contents: write  # allow the bot to push the cleaned file
-
-jobs:
-  clean:
-    # run only for same-repo branches (push) and same-repo PRs from collaborators
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Remove only metadata.widgets (surgical fix)
-        run: |
-          set -euo pipefail
-          mapfile -t NBS < <(git ls-files '*.ipynb' || true)
-          [ "${#NBS[@]}" -eq 0 ] && { echo "No notebooks found."; exit 0; }
-
-          python3 <<'PY'
+    # Run a single Python pass over all notebooks
+    python3 - <<'PY' "${NBS[@]}"
 import json, pathlib, sys
 
-changed = False
+changed_any = False
 for nb in sys.argv[1:]:
     p = pathlib.Path(nb)
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         continue
+
+    changed = False
+
+    # 1) Drop top-level metadata.widgets entirely
     meta = data.get("metadata", {})
     if "widgets" in meta:
         meta.pop("widgets", None)
         data["metadata"] = meta
-        p.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         changed = True
 
-print("CHANGED" if changed else "NOCHANGE")
+    # 2) Remove widget-view payloads from cell outputs
+    for cell in data.get("cells", []):
+        outputs = cell.get("outputs", [])
+        for out in outputs:
+            if isinstance(out, dict) and "data" in out and isinstance(out["data"], dict):
+                if "application/vnd.jupyter.widget-view+json" in out["data"]:
+                    out["data"].pop("application/vnd.jupyter.widget-view+json", None)
+                    # if that leaves 'data' empty, optionally prune the whole output
+                    if not out["data"]:
+                        # mark for pruning by replacing with None
+                        out["__drop__"] = True
+                        changed = True
+        # actually drop outputs we marked empty
+        if any(isinstance(o, dict) and o.get("__drop__") for o in outputs):
+            cell["outputs"] = [o for o in outputs if not (isinstance(o, dict) and o.get("__drop__"))]
+            for o in cell["outputs"]:
+                if isinstance(o, dict):
+                    o.pop("__drop__", None)
+            changed = True
+
+    if changed:
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        changed_any = True
+
+print("CHANGED" if changed_any else "NOCHANGE")
 PY
-          "${NBS[@]}"
 
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No changes after cleaning."
-            exit 0
-          fi
+    git add -A
+    if git diff --cached --quiet; then
+      echo "No changes after cleaning."
+      exit 0
+    fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore: remove metadata.widgets from notebooks [skip ci]"
-          git push
+    git config user.name "github-actions[bot]"
+    git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+    git commit -m "chore: scrub ipywidgets state & outputs from notebooks [skip ci]"
+    git push
